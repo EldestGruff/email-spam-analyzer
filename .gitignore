@@ -1,0 +1,19 @@
+# Sensitive files - NEVER commit these
+.icloud_pass_temp
+*.backup
+__pycache__/
+*.pyc
+
+# Temporary files
+/tmp/
+*.tmp
+.DS_Store
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output files
+email_analysis.json
