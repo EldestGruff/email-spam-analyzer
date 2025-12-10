@@ -155,6 +155,95 @@ def list_folders(imap):
         print(f"Error listing folders: {e}")
         return None
 
+def parse_folder_name(folder_line):
+    """Extract clean folder name from IMAP LIST response"""
+    # IMAP returns: b'(\\HasNoChildren) "/" "INBOX"'
+    # We want: INBOX
+    try:
+        if isinstance(folder_line, bytes):
+            folder_line = folder_line.decode('utf-8')
+        # Extract the quoted folder name at the end
+        parts = folder_line.split('"')
+        if len(parts) >= 4:
+            return parts[-2]  # Second-to-last quoted part is the folder name
+        return None
+    except:
+        return None
+
+def get_folders_with_unread(imap):
+    """Get all folders with their unread message counts"""
+    # System folders to skip
+    skip_folders = ['Junk', 'Trash', 'Sent', 'Drafts', 'Archive', 'Deleted Messages', 'Sent Messages']
+    
+    try:
+        status, folders = imap.list()
+        if status != 'OK':
+            return None
+        
+        folders_with_counts = []
+        
+        for folder_line in folders:
+            folder_name = parse_folder_name(folder_line)
+            
+            if not folder_name or folder_name in skip_folders:
+                continue
+            
+            try:
+                # Select folder (read-only)
+                imap.select(folder_name, readonly=True)
+                
+                # Search for unread messages
+                status, messages = imap.search(None, 'UNSEEN')
+                
+                if status == 'OK' and messages[0]:
+                    unread_count = len(messages[0].split())
+                    if unread_count > 0:
+                        folders_with_counts.append({
+                            'name': folder_name,
+                            'unread': unread_count
+                        })
+            except Exception as e:
+                # Skip folders we can't access
+                print(f"  (Skipped {folder_name}: {e})")
+                continue
+        
+        return folders_with_counts
+    
+    except Exception as e:
+        print(f"Error getting folders: {e}")
+        return None
+
+def select_folder_menu(folders_with_counts):
+    """Display folder menu and let user select which to review"""
+    if not folders_with_counts:
+        print("No folders with unread messages found.")
+        return None
+    
+    print("\n" + "=" * 60)
+    print("FOLDERS WITH UNREAD MESSAGES")
+    print("=" * 60)
+    
+    for i, folder in enumerate(folders_with_counts, 1):
+        print(f"{i}. {folder['name']} ({folder['unread']} unread)")
+    
+    print("\nEnter folder number to review (or 'q' to quit): ", end="")
+    
+    choice = input().strip().lower()
+    
+    if choice == 'q':
+        return None
+    
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(folders_with_counts):
+            return folders_with_counts[idx]['name']
+        else:
+            print("Invalid selection.")
+            return None
+    except ValueError:
+        print("Invalid input.")
+        return None
+
 def move_to_spam(imap, msg_id):
     """Move message to Junk/Spam folder"""
     try:
@@ -206,8 +295,8 @@ def unsubscribe_and_delete(imap, msg_id, email_msg):
     # TODO: Could add automatic HTTP request to click unsubscribe
     return True, f"Unsubscribe link found", unsub_links[0]
 
-def connect_and_analyze(email_addr, num_messages=50):
-    """Connect to iCloud and analyze recent emails"""
+def connect_and_analyze(email_addr, folder_name="INBOX", num_messages=50):
+    """Connect to iCloud and analyze recent emails from specified folder"""
     password = get_password()
     if not password:
         return None
@@ -217,7 +306,7 @@ def connect_and_analyze(email_addr, num_messages=50):
         print(f"Connecting to iCloud Mail for {email_addr}...")
         imap = imaplib.IMAP4_SSL("imap.mail.me.com", 993)
         imap.login(email_addr, password)
-        imap.select("INBOX")
+        imap.select(folder_name)
         
         # Debug: List available folders
         print("\nChecking available folders...")
@@ -490,32 +579,80 @@ if __name__ == "__main__":
     if not icloud_email:
         icloud_email = "paf@fennerfam.com"
     
-    result = connect_and_analyze(icloud_email, num_messages=30)
+    # Connect and get folder list
+    password = get_password()
+    if not password:
+        print("Failed to get password")
+        exit(1)
     
-    if result:
-        imap, analysis_results, email_objects = result
+    try:
+        print(f"Connecting to iCloud Mail for {icloud_email}...")
+        imap = imaplib.IMAP4_SSL("imap.mail.me.com", 993)
+        imap.login(icloud_email, password)
         
-        # Start interactive review
-        print("Starting interactive email review...\n")
-        actions = interactive_review(imap, analysis_results, email_objects)
+        # Get folders with unread messages
+        print("\nScanning folders for unread messages...")
+        folders_with_counts = get_folders_with_unread(imap)
         
-        # Clean up IMAP connection
-        try:
-            imap.expunge()  # Permanently remove deleted messages
-            imap.close()
+        if not folders_with_counts:
+            print("\nNo unread messages found in any folder!")
             imap.logout()
-        except:
-            pass
+            exit(0)
         
-        # Print summary
-        print("\n" + "=" * 80)
-        print("REVIEW COMPLETE")
-        print("=" * 80)
-        print(f"Marked as spam: {actions['spam']}")
-        print(f"Unsubscribed and deleted: {actions['unsubscribed']}")
-        print(f"Deleted: {actions['deleted']}")
-        print(f"Kept: {actions['kept']}")
-        print("=" * 80)
+        # Let user select folder
+        selected_folder = select_folder_menu(folders_with_counts)
         
-    else:
-        print("Failed to analyze emails")
+        if not selected_folder:
+            print("No folder selected. Exiting.")
+            imap.logout()
+            exit(0)
+        
+        # Close current connection and reconnect for analysis
+        # (This is cleaner than trying to reuse the connection)
+        imap.logout()
+        
+        print(f"\nAnalyzing folder: {selected_folder}...\n")
+        
+        # Get the unread count for this folder
+        folder_info = next((f for f in folders_with_counts if f['name'] == selected_folder), None)
+        num_messages = folder_info['unread'] if folder_info else 30
+        
+        # Analyze the selected folder
+        result = connect_and_analyze(icloud_email, folder_name=selected_folder, num_messages=num_messages)
+        
+        if result:
+            imap, analysis_results, email_objects = result
+            
+            # Start interactive review
+            print("Starting interactive email review...\n")
+            actions = interactive_review(imap, analysis_results, email_objects)
+            
+            # Clean up IMAP connection
+            try:
+                imap.expunge()  # Permanently remove deleted messages
+                imap.close()
+                imap.logout()
+            except:
+                pass
+            
+            # Print summary
+            print("\n" + "=" * 80)
+            print("REVIEW COMPLETE")
+            print("=" * 80)
+            print(f"Folder reviewed: {selected_folder}")
+            print(f"Marked as spam: {actions['spam']}")
+            print(f"Unsubscribed and deleted: {actions['unsubscribed']}")
+            print(f"Deleted: {actions['deleted']}")
+            print(f"Kept: {actions['kept']}")
+            print("=" * 80)
+            
+        else:
+            print("Failed to analyze emails")
+            
+    except imaplib.IMAP4.error as e:
+        print(f"IMAP Error: {e}")
+        print("Check your email address and app-specific password")
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        print(traceback.format_exc())
